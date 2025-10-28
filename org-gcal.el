@@ -1542,19 +1542,34 @@ Return an Emacs time object from ‘encode-time'."
   (format-time-string "%FT%T%z" time (car (org-gcal--time-zone 0))))
 
 (defun org-gcal--format-iso2org (str &optional tz)
-  (let* ((plst (org-gcal--parse-date str))
-         (seconds (org-gcal--time-to-seconds plst)))
-    (concat
-     "<"
-     (format-time-string
-      (if (< 11 (length str)) "%Y-%m-%d %a %H:%M" "%Y-%m-%d %a")
-      (seconds-to-time
-       (+ (if tz (car (org-gcal--time-zone seconds)) 0)
-          seconds)))
-     ;;(if (and repeat (not (string= repeat ""))) (concat " " repeat) "")
-     ">")))
+  (if (or (null str) (string-empty-p str))
+      nil
+    (let* ((plst (org-gcal--parse-date str))
+           (seconds (org-gcal--time-to-seconds plst)))
+      (concat
+       "<"
+       (format-time-string
+        (if (< 11 (length str)) "%Y-%m-%d %a %H:%M" "%Y-%m-%d %a")
+        (seconds-to-time
+         (+ (if tz (car (org-gcal--time-zone seconds)) 0)
+            seconds)))
+       ;;(if (and repeat (not (string= repeat ""))) (concat " " repeat) "")
+       ">"))))
 
 (defun org-gcal--format-org2iso (year mon day &optional hour min tz)
+  ;; Validate required date components
+  (unless (and (integerp year) (integerp mon) (integerp day))
+    (user-error "org-gcal: Date components must be integers (year=%s mon=%s day=%s)"
+                year mon day))
+  (when (or (< mon 1) (> mon 12))
+    (user-error "org-gcal: Invalid month %s (must be 1-12)" mon))
+  (when (or (< day 1) (> day 31))
+    (user-error "org-gcal: Invalid day %s (must be 1-31)" day))
+  ;; Validate optional time components if provided
+  (when (and hour (or (< hour 0) (> hour 23)))
+    (user-error "org-gcal: Invalid hour %s (must be 0-23)" hour))
+  (when (and min (or (< min 0) (> min 59)))
+    (user-error "org-gcal: Invalid minute %s (must be 0-59)" min))
   (let ((seconds (time-to-seconds (encode-time 0
                                                (or min 0)
                                                (or hour 0)
@@ -1567,15 +1582,17 @@ Return an Emacs time object from ‘encode-time'."
        (if tz (car (org-gcal--time-zone seconds)) 0))))))
 
 (defun org-gcal--iso-next-day (str &optional previous-p)
-  (let ((format (if (< 11 (length str))
-                    "%Y-%m-%dT%H:%M"
-                  "%Y-%m-%d"))
-        (plst (org-gcal--parse-date str))
-        (prev (if previous-p -1 +1)))
-    (format-time-string format
-                        (seconds-to-time
-                         (+ (org-gcal--time-to-seconds plst)
-                            (* 60 60 24 prev))))))
+  (if (or (null str) (string-empty-p str))
+      nil
+    (let ((format (if (< 11 (length str))
+                      "%Y-%m-%dT%H:%M"
+                    "%Y-%m-%d"))
+          (plst (org-gcal--parse-date str))
+          (prev (if previous-p -1 +1)))
+      (format-time-string format
+                          (seconds-to-time
+                           (+ (org-gcal--time-to-seconds plst)
+                              (* 60 60 24 prev)))))))
 
 (defun org-gcal--iso-previous-day (str)
   (org-gcal--iso-next-day str t))
@@ -1589,6 +1606,90 @@ Return an Emacs time object from ‘encode-time'."
            local-timezone)
       (format-time-string "%Y-%m-%dT%H:%M:%S%z" (parse-iso8601-time-string date-time) local-timezone)
     date-time))
+
+(defun org-gcal--format-event-timestamp (start end &optional recurrence old-start old-end)
+  "Format timestamp string for event from START to END dates.
+
+For recurring events with OLD-START and OLD-END, preserves original timestamps.
+Returns formatted org timestamp string or nil if START is nil."
+  (when (and start end)
+    ;; Keep existing timestamps for parent recurring events.
+    (when (and recurrence old-start old-end)
+      (setq start old-start
+            end old-end))
+    (cond
+     ;; Single point in time or all-day event
+     ((or (string= start end) (org-gcal--alldayp start end))
+      (org-gcal--format-iso2org start))
+     ;; Same-day time range
+     ((and
+       (= (plist-get (org-gcal--parse-date start) :year)
+          (plist-get (org-gcal--parse-date end)   :year))
+       (= (plist-get (org-gcal--parse-date start) :mon)
+          (plist-get (org-gcal--parse-date end)   :mon))
+       (= (plist-get (org-gcal--parse-date start) :day)
+          (plist-get (org-gcal--parse-date end)   :day)))
+      (format "<%s-%s>"
+              (org-gcal--format-date start "%Y-%m-%d %a %H:%M")
+              (org-gcal--format-date end "%H:%M")))
+     ;; Multi-day range
+     (t
+      (format "%s--%s"
+              (org-gcal--format-iso2org start)
+              (org-gcal--format-iso2org
+               (if (< 11 (length end))
+                   end
+                 (org-gcal--iso-previous-day end))))))))
+
+(defun org-gcal--determine-headline (summary existing-headline cancelled-keyword)
+  "Determine what headline to use for event with SUMMARY.
+
+EXISTING-HEADLINE is current org headline text.
+CANCELLED-KEYWORD is the todo keyword for cancelled events.
+Returns string for new headline."
+  (cond
+   ;; Don't update headline if the new summary is the same as the CANCELLED keyword
+   ((equal summary cancelled-keyword) existing-headline)
+   ;; Use summary from server if available
+   (summary summary)
+   ;; Set to \"busy\" if there's no existing headline and no summary
+   ((or (null existing-headline)
+        (string-empty-p existing-headline))
+    "busy")
+   ;; Keep existing headline
+   (t existing-headline)))
+
+(defun org-gcal--format-description-for-drawer (description)
+  "Format DESCRIPTION for insertion into org drawer.
+
+Replaces leading asterisks with ✱ to avoid creating org headlines.
+Ensures proper trailing newline. Returns formatted string or nil."
+  (when description
+    (concat
+     (replace-regexp-in-string "^\*" "✱" description)
+     (if (string= "\n" (org-gcal--safe-substring description -1)) "" "\n"))))
+
+(defun org-gcal--determine-source-property (source existing-roam-refs existing-link)
+  "Determine which property to use for event SOURCE link.
+
+EXISTING-ROAM-REFS is list of current ROAM_REFS values.
+EXISTING-LINK is current link property value.
+Returns plist with :property-name and :property-value, or nil if no source."
+  (when source
+    (let ((url (plist-get source :url))
+          (title (plist-get source :title)))
+      (cond
+       ;; Use ROAM_REFS if: no existing link, ROAM_REFS has <=1 entry, and source has no title
+       ((and (null existing-link)
+             (<= (length existing-roam-refs) 1)
+             (or (null title)
+                 (string-empty-p title)))
+        (list :property-name "ROAM_REFS"
+              :property-value url))
+       ;; Otherwise use link property with org-link format
+       (t
+        (list :property-name "link"
+              :property-value (org-link-make-string url title)))))))
 
 (defun org-gcal--update-entry (calendar-id event &optional update-mode)
   "Update the entry at the current heading with information from EVENT.
@@ -1628,41 +1729,21 @@ heading."
          (recurrence (plist-get event :recurrence))
          (elem))
     (when loc (replace-regexp-in-string "\n" ", " loc))
+    ;; Update headline using extracted pure function
     (org-edit-headline
-     (cond
-      ;; Don’t update headline if the new summary is the same as the CANCELLED
-      ;; todo keyword.
-      ((equal smry org-gcal-cancelled-todo-keyword) (org-gcal--headline))
-      (smry smry)
-      ;; Set headline to “busy” if there is no existing headline and no summary
-      ;; from server.
-      ((or (null (org-gcal--headline))
-           (string-empty-p (org-gcal--headline)))
-       "busy")
-      (t (org-gcal--headline))))
+     (org-gcal--determine-headline smry (org-gcal--headline) org-gcal-cancelled-todo-keyword))
     (org-entry-put (point) org-gcal-etag-property etag)
     (when recurrence (org-entry-put (point) "recurrence" (format "%s" recurrence)))
     (when loc (org-entry-put (point) "LOCATION" loc))
+    ;; Handle source link using extracted pure function
     (when source
-      (let ((roam-refs
-             (org-entry-get-multivalued-property (point) "ROAM_REFS"))
-            (link (org-entry-get (point) "link")))
-        (cond
-         ;; ROAM_REFS can contain multiple references, but only bare URLs are
-         ;; supported. To make sure we can round-trip between ROAM_REFS and
-         ;; Google Calendar, only import to ROAM_REFS if there is no title in
-         ;; the source, and if ROAM_REFS has at most one entry.
-         ((and (null link)
-               (<= (length roam-refs) 1)
-               (or (null (plist-get source :title))
-                   (string-empty-p (plist-get source :title))))
-          (org-entry-put (point) "ROAM_REFS"
-                         (plist-get source :url)))
-         (t
-          (org-entry-put (point) "link"
-                         (org-link-make-string
-                          (plist-get source :url)
-                          (plist-get source :title)))))))
+      (let* ((roam-refs (org-entry-get-multivalued-property (point) "ROAM_REFS"))
+             (link (org-entry-get (point) "link"))
+             (source-prop (org-gcal--determine-source-property source roam-refs link)))
+        (when source-prop
+          (org-entry-put (point)
+                         (plist-get source-prop :property-name)
+                         (plist-get source-prop :property-value)))))
     (when transparency (org-entry-put (point) "TRANSPARENCY" transparency))
     (when meet
       (org-entry-put
@@ -1694,43 +1775,21 @@ heading."
     (newline)
     (insert (format ":%s:" org-gcal-drawer-name))
     (newline)
-    ;; Keep existing timestamps for parent recurring events.
-    (when (and recurrence old-start old-end)
-      (setq start old-start
-            end old-end))
-    (let*
-        ((timestamp
-          (if (or (string= start end) (org-gcal--alldayp start end))
-              (org-gcal--format-iso2org start)
-            (if (and
-                 (= (plist-get (org-gcal--parse-date start) :year)
-                    (plist-get (org-gcal--parse-date end)   :year))
-                 (= (plist-get (org-gcal--parse-date start) :mon)
-                    (plist-get (org-gcal--parse-date end)   :mon))
-                 (= (plist-get (org-gcal--parse-date start) :day)
-                    (plist-get (org-gcal--parse-date end)   :day)))
-                (format "<%s-%s>"
-                        (org-gcal--format-date start "%Y-%m-%d %a %H:%M")
-                        (org-gcal--format-date end "%H:%M"))
-              (format "%s--%s"
-                      (org-gcal--format-iso2org start)
-                      (org-gcal--format-iso2org
-                       (if (< 11 (length end))
-                           end
-                         (org-gcal--iso-previous-day end))))))))
+    ;; Format timestamp using extracted pure function
+    (let ((timestamp (org-gcal--format-event-timestamp start end recurrence old-start old-end)))
       (if (org-element-property :scheduled elem)
           (unless (and recurrence old-start)
-            ;; Ensure CLOSED timestamp isn’t wiped out by ‘org-gcal-sync’ (see
+            ;; Ensure CLOSED timestamp isn't wiped out by 'org-gcal-sync' (see
             ;; https://github.com/kidd/org-gcal.el/issues/218).
             (let ((org-closed-keep-when-no-todo t))
               (org-schedule nil timestamp)))
-        (insert timestamp)
-        (newline)
-        (when desc (newline))))
-    ;; Insert event description if present.
-    (when desc
-      (insert (replace-regexp-in-string "^\*" "✱" desc))
-      (insert (if (string= "\n" (org-gcal--safe-substring desc -1)) "" "\n")))
+        (when timestamp
+          (insert timestamp)
+          (newline)
+          (when desc (newline)))))
+    ;; Insert formatted description using extracted pure function
+    (when-let ((formatted-desc (org-gcal--format-description-for-drawer desc)))
+      (insert formatted-desc))
     (insert ":END:")
     (when (org-gcal--event-cancelled-p event)
       (save-excursion
